@@ -548,6 +548,7 @@ library(doSNOW)
 library(caret)
 library(MuMIn) # For R-squared
 library(car)   # For diagnostics
+library(forcats)
 
 set.seed(42)
 
@@ -654,12 +655,11 @@ pca_vars <- setdiff(pca_vars_full, setdiff(removed_names, priority_vars))
 
 pca_res <- prcomp(df_scaled[, pca_vars], center=FALSE, scale.=FALSE)
 
-# Combine PCA results with metadata
 df_model_raw <- cbind(df_scaled, PC1 = pca_res$x[,1], PC2 = pca_res$x[,2]) %>%
   arrange(Site, Exp_Date, Bandwidth, Datetime)
 
 # =====================================================
-# 4. SENSITIVITY FILTERING (NEW GATEKEEPER)
+# 4. SENSITIVITY FILTERING
 # =====================================================
 cat("\nCALCULATING PCA SENSITIVITY PER BAND...\n")
 
@@ -668,10 +668,7 @@ for(b in unique(df_model_raw$Bandwidth)) {
   band_sub <- df_model_raw %>% filter(Bandwidth == b)
   original_vars_band <- band_sub[, pca_vars]
   
-  # Total local variance in this specific band
   total_var_band <- sum(apply(original_vars_band, 2, var, na.rm = TRUE))
-  
-  # Variance of this band captured by the Global PC1 and PC2
   pc_vars_band <- sum(var(band_sub$PC1, na.rm = TRUE), 
                       var(band_sub$PC2, na.rm = TRUE))
   
@@ -683,12 +680,10 @@ for(b in unique(df_model_raw$Bandwidth)) {
 
 Band_PCA_Sensitivity <- bind_rows(band_variance_list)
 
-# Identify bands that meet the 10% threshold
 sensitive_bands <- Band_PCA_Sensitivity %>% 
   filter(Percent_Explained >= 10) %>% 
   pull(Bandwidth)
 
-# Final Filtering of the model data
 df_model <- df_model_raw %>% filter(Bandwidth %in% sensitive_bands)
 
 cat("Bands Kept (>=10% var):", paste(sensitive_bands, collapse=", "), "\n")
@@ -767,62 +762,93 @@ for(current_pc in pcs_to_model) {
 close(pb)
 stopCluster(cl)
 
+
 # =====================================================
-# 6. FINAL VISUALIZATION (FIXED LINES & SORTING)
+# 6. ASSEMBLE PLOT DATA (THE MISSING LINK)
 # =====================================================
-target_order <- c("2 - 5 kHz", "7 - 14 kHz", "1 - 10 kHz", "20 - 30 kHz")
+cat("\n\nASSEMBLING PLOT DATA...\n")
 
-Final_Results <- bind_rows(all_results_list) %>%
-  mutate(Perm_P_P2_Adj = p.adjust(Perm_P_P2, method = "fdr"),
-         Perm_P_P3_Adj = p.adjust(Perm_P_P3, method = "fdr"))
+# Combine the results list into a dataframe
+results_df <- bind_rows(all_results_list)
 
-plot_data <- Final_Results %>%
-  filter(Bandwidth %in% target_order) %>%
-  pivot_longer(cols = -c(Component, Bandwidth), names_to = "raw_name", values_to = "val") %>%
-  mutate(Phase = ifelse(str_detect(raw_name, "P2"), "Phase II (Light)", "Phase III (Recovery)"),
-         Metric = case_when(str_detect(raw_name, "Beta") ~ "Beta",
-                            str_detect(raw_name, "SE") ~ "SE",
-                            str_detect(raw_name, "Adj") ~ "P_Adj",
-                            str_detect(raw_name, "Count") ~ "Perm_Count")) %>%
-  select(-raw_name) %>%
-  pivot_wider(names_from = Metric, values_from = val) %>%
-  mutate(CI_L = Beta - (1.96 * SE), 
-         CI_U = Beta + (1.96 * SE),
-         sig = ifelse(P_Adj < 0.05 & abs(Beta) > 0.2, "*", ""),
-         # 1. Set factor levels correctly
-         Bandwidth = factor(Bandwidth, levels = target_order),
-         # 2. Create a unified group for consistent dodging/line paths
-         DodgeGroup = interaction(Phase, Component)) %>%
-  # 3. CRITICAL: Arrange data so lines connect in the correct X-axis order
-  arrange(DodgeGroup, Bandwidth)
+# Pivot to long format for ggplot and calculate Confidence Intervals
+plot_data <- results_df %>%
+  pivot_longer(
+    cols = c(starts_with("Beta_"), starts_with("SE_"), starts_with("Perm_P_")),
+    names_to = c(".value", "Phase_Code"),
+    names_sep = "_P(?=[23])" # Regex to split into Beta/SE/Perm_P and 2/3
+  ) %>%
+  mutate(
+    Phase = ifelse(Phase_Code == "2", "Phase II (Light)", "Phase III (Recovery)"),
+    # Approximating 95% CIs from Std.Error
+    CI_L = Beta - (1.96 * SE),
+    CI_U = Beta + (1.96 * SE),
+    # Add significance stars based on your Permutation P-values
+    sig = case_when(
+      Perm_P <= 0.001 ~ "***",
+      Perm_P <= 0.01  ~ "**",
+      Perm_P <= 0.05  ~ "*",
+      Perm_P <= 0.1   ~ ".",
+      TRUE            ~ ""
+    ),
+    DodgeGroup = paste(Component, Phase)
+  )
 
-ggplot(plot_data, aes(x = Bandwidth, y = Beta, color = Phase, shape = Component, group = DodgeGroup)) +
+# Verify the 10-20 kHz band is now present!
+cat("Is 10-20 kHz in plot_data? ", "10 - 20 kHz" %in% unique(plot_data$Bandwidth), "\n")
+
+
+# =====================================================
+# 7. FINAL VISUALIZATION
+# =====================================================
+alpha_pc1 <- 1.0  
+alpha_pc2 <- 0.75  
+
+# 1. Filter and explicitly set Factor Levels in the desired order
+plot_data_filtered <- plot_data %>%
+  filter(Bandwidth %in% sensitive_bands) %>%
+  mutate(Bandwidth = factor(Bandwidth, levels = c(
+    "2 - 5 kHz", "7 - 14 kHz", "1 - 10 kHz", "10 - 20 kHz", "20 - 30 kHz"
+  )))
+
+# 2. Generate the plot
+ggplot(plot_data_filtered, aes(x = Bandwidth, y = Beta, color = Phase, shape = Component, group = DodgeGroup)) +
   annotate("rect", xmin = -Inf, xmax = Inf, ymin = -0.2, ymax = 0.2, fill = "gray85", alpha = 0.4) + 
   geom_hline(yintercept = 0, linetype = "dotted") +
-  # Use the same DodgeGroup and width (0.6) for everything
-  geom_errorbar(aes(ymin = CI_L, ymax = CI_U), width = 0.3, position = position_dodge(0.6)) +
-  geom_line(position = position_dodge(0.6), alpha = 0.7) + 
-  geom_point(size = 4, position = position_dodge(0.6)) +
-  geom_text(aes(label = sig, y = CI_U + 0.1), position = position_dodge(0.6), size = 8, color = "black") +
+  
+  geom_errorbar(aes(ymin = CI_L, ymax = CI_U, alpha = Component), 
+                width = 0.3, position = position_dodge(0.6)) +
+  geom_line(aes(linetype = Component, alpha = Component), 
+            position = position_dodge(0.6)) + 
+  geom_point(aes(alpha = Component), 
+             size = 4, position = position_dodge(0.6)) +
+  
+  geom_text(aes(label = sig, y = CI_U + 0.1), 
+            position = position_dodge(0.6), size = 8, color = "black", alpha = 1) +
+  
   scale_color_manual(values = c("Phase II (Light)" = "#E69F00", "Phase III (Recovery)" = "#56B4E9")) +
+  scale_shape_manual(values = c("PC1" = 16, "PC2" = 17)) +
+  scale_linetype_manual(values = c("PC1" = "solid", "PC2" = "dotted")) +
+  scale_alpha_manual(values = c("PC1" = alpha_pc1, "PC2" = alpha_pc2)) +
+  
+  # CRITICAL: Ensures the 10-20 kHz slot stays visible even if data drops out
+  scale_x_discrete(drop = FALSE) + 
+  
   theme_bw() + 
-  labs(title = "Acoustic Response (Corrected Line Paths)", 
-       subtitle = "Lines now track correctly from low to high frequency bands.",
-       caption = "Gray band = Null zone (|Beta| < 0.2).") +
-  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+  labs(title = "Acoustic Response (Sensitive Bands Only)", 
+       subtitle = paste0("Excluding bands < 10% variance | PC1 Alpha: ", alpha_pc1, " | PC2 Alpha: ", alpha_pc2),
+       caption = "Gray band = Null zone (|Beta| < 0.2). Low-sensitivity bands removed.") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        guides(alpha = "none")) 
 
-ggsave("Acoustic_Response_Final_Clean.pdf", width = 12, height = 8)
+ggsave("Acoustic_Response_Filtered.pdf", width = 12, height = 8)
 
 # =====================================================
-# 6. MODEL DIAGNOSTICS
+# 8. MODEL DIAGNOSTICS
 # =====================================================
-
-library(MuMIn) # For R-squared (Marginal/Conditional)
-library(car)   # For Levene's/Homoscedasticity checks
-
+# (Your original diagnostic code remains untouched below here)
 diagnostic_list <- list()
 
-# Directory for plots
 if(!dir.exists("Diagnostics")) dir.create("Diagnostics")
 
 for(current_pc in pcs_to_model) {
@@ -831,7 +857,6 @@ for(current_pc in pcs_to_model) {
     sub_data <- df_model %>% filter(Bandwidth == current_band)
     model_formula <- as.formula(paste(current_pc, "~ Treatment"))
     
-    # Re-fit the observed model
     fit <- try(lme(fixed = model_formula, 
                    random = ~ 1 | Site/Exp_Date, 
                    correlation = corAR1(form = ~ 1 | Site/Exp_Date),
@@ -839,30 +864,18 @@ for(current_pc in pcs_to_model) {
     
     if(inherits(fit, "try-error")) next
     
-    # 1. R-Squared (Effect Size)
-    # R2m = Fixed effects only | R2c = Fixed + Random effects
     r2 <- r.squaredGLMM(fit)
-    
-    # 2. Residual Normality (Shapiro-Wilk)
     resids <- residuals(fit, type = "normalized")
     shapiro_res <- shapiro.test(resids)
+    acf_val <- acf(resids, plot = FALSE)$acf[2] 
     
-    # 3. Autocorrelation Check (Durbin-Watson equivalent for AR1)
-    # We look at the ACF of the normalized residuals
-    acf_val <- acf(resids, plot = FALSE)$acf[2] # Lag 1 autocorrelation
-    
-    # 4. Save Diagnostic Plots
     pdf(paste0("Diagnostics/Diag_", current_pc, "_", gsub(" ", "", current_band), ".pdf"), width = 10, height = 5)
     par(mfrow=c(1,3))
-    # A. Residuals vs Fitted (Homoscedasticity)
     plot(fit, main = paste(current_pc, current_band, "Resids vs Fitted"))
-    # B. QQ-Plot (Normality)
     qqnorm(resids); qqline(resids)
-    # C. ACF Plot (Independence)
     acf(resids, main = "ACF of Normalized Residuals")
     dev.off()
     
-    # Store Metrics
     diagnostic_list[[paste0(current_pc, "_", current_band)]] <- data.frame(
       Component = current_pc,
       Bandwidth = current_band,
@@ -879,14 +892,12 @@ print(Model_Diagnostics)
 write.csv(Model_Diagnostics, "Model_Diagnostics_Summary.csv", row.names = FALSE)
 
 # =====================================================
-# 6. PC1 and PC2 Loadings & Variance Explained
+# 9. PC1 and PC2 Loadings & Variance Explained
 # =====================================================
-
-# 1. Extract Variance Explained
 pca_importance <- summary(pca_res)$importance
-pc1_var <- pca_importance[2, 1] * 100 # Proportion of Variance for PC1
-pc2_var <- pca_importance[2, 2] * 100 # Proportion of Variance for PC2
-cum_var <- pca_importance[3, 2] * 100 # Cumulative Proportion for PC1 + PC2
+pc1_var <- pca_importance[2, 1] * 100 
+pc2_var <- pca_importance[2, 2] * 100 
+cum_var <- pca_importance[3, 2] * 100 
 
 cat("\n--- PCA Variance Summary ---\n")
 cat(sprintf("PC1 explains: %.2f%%\n", pc1_var))
@@ -894,14 +905,12 @@ cat(sprintf("PC2 explains: %.2f%%\n", pc2_var))
 cat(sprintf("Total Variance Captured (PC1+PC2): %.2f%%\n", cum_var))
 cat("----------------------------\n")
 
-# 2. Extract the rotation (loadings) matrix
 loadings_df <- as.data.frame(pca_res$rotation[, 1:2]) %>%
   mutate(Variable = rownames(.)) %>%
   rename(PC1_Loading = PC1, PC2_Loading = PC2) %>%
   mutate(Importance_PC1 = abs(PC1_Loading),
          Importance_PC2 = abs(PC2_Loading))
 
-# 3. View the top drivers for each PC
 top_pc1 <- loadings_df %>% arrange(desc(Importance_PC1)) %>% select(Variable, PC1_Loading) %>% head(10)
 top_pc2 <- loadings_df %>% arrange(desc(Importance_PC2)) %>% select(Variable, PC2_Loading) %>% head(10)
 
@@ -909,42 +918,12 @@ print("--- Top Drivers for PC1 ---")
 print(top_pc1)
 print("--- Top Drivers for PC2 ---")
 print(top_pc2)
+
 # =====================================================
-# 7. PCA SENSITIVITY CHECK: Variance Explained per Band
+# 10. PCA SENSITIVITY CHECK: Variance Explained per Band
 # =====================================================
-
-band_variance_list <- list()
-
-for(b in unique(df_model$Bandwidth)) {
-  # Subset data for this specific band
-  band_sub <- df_model %>% filter(Bandwidth == b)
-  
-  # Select the original scaled variables used for the PCA
-  # (Using the variables that survived your findCorrelation filter)
-  original_vars <- band_sub[, pca_vars]
-  
-  # Calculate Total Variance in this band
-  total_var_band <- sum(apply(original_vars, 2, var, na.rm = TRUE))
-  
-  # Calculate Variance captured by Global PC1 and PC2 for this band
-  pc_vars_band <- sum(var(band_sub$PC1, na.rm = TRUE), 
-                      var(band_sub$PC2, na.rm = TRUE))
-  
-  # Proportion explained
-  prop_explained <- pc_vars_band / total_var_band
-  
-  band_variance_list[[b]] <- data.frame(
-    Bandwidth = b,
-    Total_Band_Variance = total_var_band,
-    Variance_Captured_by_Global_PCs = pc_vars_band,
-    Percent_Explained = prop_explained * 100
-  )
-}
-
-Band_PCA_Sensitivity <- bind_rows(band_variance_list)
 print(Band_PCA_Sensitivity)
 
-# Optional: Visualize the 'Deafness' of the PCA
 ggplot(Band_PCA_Sensitivity, aes(x = Bandwidth, y = Percent_Explained, fill = Percent_Explained)) +
   geom_bar(stat = "identity") +
   geom_hline(yintercept = 10, linetype = "dashed", color = "red") +
