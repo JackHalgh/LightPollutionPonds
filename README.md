@@ -546,6 +546,8 @@ library(nlme)
 library(foreach)
 library(doSNOW)
 library(caret)
+library(gridExtra)
+library(MuMIn)
 
 set.seed(42)
 
@@ -557,6 +559,7 @@ registerDoSNOW(cl)
 # =====================================================
 # 1. IMPORT & INITIAL PROCESSING
 # =====================================================
+# Update this path to your local directory
 dir_path <- "C:/Users/Administrador/OneDrive - McGill University/Light pollution and pond soundscapes/Feb 2026/Without NDSI & Anthro_Energy/All data"
 setwd(dir_path)
 
@@ -636,7 +639,7 @@ df_global_treated <- df_global_proc %>%
   )
 
 # =====================================================
-# 3. BAND-SPECIFIC PCA
+# 3. BAND-SPECIFIC PCA (Capturing Loadings & Variance)
 # =====================================================
 priority_vars <- c("ACI", "Bio_Energy", "Event_Count", "ZCR_Mean")
 spectral_vars <- c("ADI", "RMS_Mean", paste0("MFCC_", 1:13))
@@ -644,6 +647,8 @@ pca_vars_full <- c(priority_vars, spectral_vars)
 
 bands <- unique(df_global_treated$Bandwidth)
 band_data_list <- list()
+variance_explained_list <- list() 
+loadings_list <- list()          
 
 for(b in bands) {
   b_data <- df_global_treated %>% filter(Bandwidth == b)
@@ -659,6 +664,18 @@ for(b in bands) {
   } else { valid_vars }
   
   pca_res <- prcomp(b_scaled[, pca_vars_b], center=FALSE, scale.=FALSE)
+  
+  # Export Variance
+  var_imp <- summary(pca_res)$importance
+  variance_explained_list[[b]] <- data.frame(Bandwidth = b, PC1_Var_Explained = var_imp[2,1], PC2_Var_Explained = var_imp[2,2])
+  
+  # Export Loadings
+  loads <- as.data.frame(pca_res$rotation[, 1:2])
+  colnames(loads) <- c("PC1_Loading", "PC2_Loading")
+  loads$Variable <- rownames(loads)
+  loads$Bandwidth <- b
+  loadings_list[[b]] <- loads
+  
   b_data$PC1 <- pca_res$x[,1]
   b_data$PC2 <- pca_res$x[,2]
   band_data_list[[b]] <- b_data
@@ -672,6 +689,8 @@ df_model <- bind_rows(band_data_list) %>% arrange(Site, Exp_Date, Bandwidth, Dat
 pcs_to_model <- c("PC1", "PC2")
 n_perms <- 999
 all_results_list <- list()
+all_null_distributions <- list() 
+observed_stats_list <- list()    
 
 for(current_pc in pcs_to_model) {
   for(current_band in bands) {
@@ -691,12 +710,19 @@ for(current_pc in pcs_to_model) {
     
     if(inherits(obs_model, "try-error")) next
     
+    # --- FIXED: Extraction of Random Effect SDs by Index ---
+    vc <- VarCorr(obs_model)
+    sd_site  <- as.numeric(vc[2, "StdDev"])
+    sd_date  <- as.numeric(vc[4, "StdDev"])
+    sd_resid <- as.numeric(vc[nrow(vc), "StdDev"])
+    
     summ_tab <- summary(obs_model)$tTable
     obs_t_p2 <- summ_tab["TreatmentPhase II", "t-value"]
     obs_t_p3 <- summ_tab["TreatmentPhase III", "t-value"]
     
+    # Run Permutations
     null_dist <- foreach(i = 1:n_perms, .combine = 'rbind', .packages = c('nlme', 'dplyr')) %dopar% {
-      p_data <- sub_data %>% group_by(Site) %>% mutate(Treatment = sample(Treatment)) %>% ungroup()
+      p_data <- sub_data %>% group_by(Site, Exp_Date) %>% mutate(Treatment = sample(Treatment)) %>% ungroup()
       p_mod <- try(lme(fixed = model_formula, random = ~ 1 | Site/Exp_Date, 
                        correlation = corAR1(form = ~ Time_Index | Site/Exp_Date),
                        data = p_data, control = lmeControl(opt = "optim")), silent = TRUE)
@@ -707,392 +733,80 @@ for(current_pc in pcs_to_model) {
     }
     
     null_dist <- as.data.frame(null_dist)
+    id <- paste0(current_pc, "_", gsub(" ", "", current_band))
+    all_null_distributions[[id]] <- null_dist
+    observed_stats_list[[id]] <- c(p2 = obs_t_p2, p3 = obs_t_p3)
+    
     p_val_p2 <- (sum(abs(na.omit(null_dist$p2)) >= abs(obs_t_p2)) + 1) / (sum(!is.na(null_dist$p2)) + 1)
     p_val_p3 <- (sum(abs(na.omit(null_dist$p3)) >= abs(obs_t_p3)) + 1) / (sum(!is.na(null_dist$p3)) + 1)
     
-    all_results_list[[paste0(current_pc, "_", current_band)]] <- data.frame(
+    all_results_list[[id]] <- data.frame(
       Component = current_pc, Bandwidth = current_band,
       Beta_P2 = summ_tab["TreatmentPhase II", "Value"], SE_P2 = summ_tab["TreatmentPhase II", "Std.Error"], Perm_P_P2 = p_val_p2,
-      Beta_P3 = summ_tab["TreatmentPhase III", "Value"], SE_P3 = summ_tab["TreatmentPhase III", "Std.Error"], Perm_P_P3 = p_val_p3
+      Beta_P3 = summ_tab["TreatmentPhase III", "Value"], SE_P3 = summ_tab["TreatmentPhase III", "Std.Error"], Perm_P_P3 = p_val_p3,
+      SD_Site = sd_site, SD_ExpDate = sd_date, SD_Residual = sd_resid
     )
   }
 }
-
 stopCluster(cl)
-results_raw <- bind_rows(all_results_list)
 
 # =====================================================
-# 5. MULTIPLE TESTING CORRECTION (FDR)
+# 5. FDR CORRECTION & PERMUTATION PLOTS
 # =====================================================
-results <- results_raw %>%
+Final_Permutation_Results <- bind_rows(all_results_list) %>%
   group_by(Component) %>% 
   mutate(
     FDR_P_P2 = p.adjust(Perm_P_P2, method = "fdr"),
     FDR_P_P3 = p.adjust(Perm_P_P3, method = "fdr")
-  ) %>%
-  ungroup()
+  ) %>% ungroup()
+
+if(!dir.exists("Permutation_Plots")) dir.create("Permutation_Plots")
+for(id in names(all_null_distributions)) {
+  null_df <- all_null_distributions[[id]]; obs <- observed_stats_list[[id]]
+  p2_plt <- ggplot(null_df, aes(x = p2)) + geom_histogram(bins = 40, fill = "#E69F00", alpha = 0.7) +
+    geom_vline(xintercept = obs["p2"], color = "red", linetype = "dashed") + labs(title = paste(id, "P2")) + theme_minimal()
+  p3_plt <- ggplot(null_df, aes(x = p3)) + geom_histogram(bins = 40, fill = "#56B4E9", alpha = 0.7) +
+    geom_vline(xintercept = obs["p3"], color = "red", linetype = "dashed") + labs(title = paste(id, "P3")) + theme_minimal()
+  ggsave(filename = paste0("Permutation_Plots/", id, ".png"), plot = grid.arrange(p2_plt, p3_plt, ncol=2), width=10, height=4)
+}
 
 # =====================================================
-# 6. DATA PREP FOR VISUALIZATION
+# 6. VISUALIZATION (Figure 4)
 # =====================================================
-plot_data_faceted <- bind_rows(
-  results %>% select(Component, Bandwidth, Beta = Beta_P2, SE = SE_P2, pval = FDR_P_P2) %>% mutate(Phase = "Phase II (Light)"),
-  results %>% select(Component, Bandwidth, Beta = Beta_P3, SE = SE_P3, pval = FDR_P_P3) %>% mutate(Phase = "Phase III (Recovery)")
-) %>%
-  mutate(
-    CI_L = Beta - (1.96 * SE),
-    CI_U = Beta + (1.96 * SE),
-    sig = ifelse(pval < 0.05, "*", ""),
-    Phase = factor(Phase, levels = c("Phase II (Light)", "Phase III (Recovery)")),
-    Bandwidth = factor(Bandwidth, levels = c("2 - 5 kHz", "7 - 14 kHz", "1 - 10 kHz", "10 - 20 kHz", "20 - 30 kHz", "30 - 40 kHz", "40 - 47 kHz"))
-  )
+plot_data <- bind_rows(
+  Final_Permutation_Results %>% select(Component, Bandwidth, Beta = Beta_P2, SE = SE_P2, pval = FDR_P_P2) %>% mutate(Phase = "Phase II (Light)"),
+  Final_Permutation_Results %>% select(Component, Bandwidth, Beta = Beta_P3, SE = SE_P3, pval = FDR_P_P3) %>% mutate(Phase = "Phase III (Recovery)")
+) %>% mutate(CI_L = Beta - (1.96*SE), CI_U = Beta + (1.96*SE), sig = ifelse(pval < 0.05, "*", ""),
+             Phase = factor(Phase, levels=c("Phase II (Light)", "Phase III (Recovery)")),
+             Bandwidth = factor(Bandwidth, levels=c("2 - 5 kHz", "7 - 14 kHz", "1 - 10 kHz", "10 - 20 kHz", "20 - 30 kHz", "30 - 40 kHz", "40 - 47 kHz")))
 
-# =====================================================
-# 7. FINAL VISUALIZATION
-# =====================================================
-ggplot(plot_data_faceted, aes(x = Component, y = Beta, color = Phase, shape = Component, linetype = Component)) +
+fig4 <- ggplot(plot_data, aes(x = Component, y = Beta, color = Phase)) +
   annotate("rect", xmin = -Inf, xmax = Inf, ymin = -0.2, ymax = 0.2, fill = "gray90", alpha = 0.5) +
-  geom_hline(yintercept = 0, linetype = "dotted", color = "black", alpha = 0.5) +
-  geom_errorbar(aes(ymin = CI_L, ymax = CI_U), width = 0.3, linewidth = 0.8, position = position_dodge(0.7), show.legend = FALSE) +
+  geom_hline(yintercept = 0, linetype = "dotted") +
+  geom_errorbar(aes(ymin = CI_L, ymax = CI_U), width = 0.2, position = position_dodge(0.7)) +
   geom_point(size = 4, position = position_dodge(0.7)) +
-  geom_text(aes(label = sig, y = CI_U + 0.12), position = position_dodge(0.7), size = 8, color = "black", fontface = "bold") +
-  scale_shape_manual(values = c("PC1" = 16, "PC2" = 17)) +
+  geom_text(aes(label = sig, y = CI_U + 0.1), position = position_dodge(0.7), size = 8) +
   scale_color_manual(values = c("Phase II (Light)" = "#E69F00", "Phase III (Recovery)" = "#56B4E9")) +
-  scale_linetype_manual(values = c("PC1" = "solid", "PC2" = "dotted")) +
-  facet_wrap(~ Bandwidth, ncol = 4) +
-  theme_bw() +
-  labs(
-    x = "Principal component", 
-    y = "Effect size (Beta ± 95% CI)",
-    caption = "Stars indicate FDR-corrected p < 0.05 via block permutation."
-  ) +
-  theme(legend.position = "bottom", strip.text = element_text(face = "bold"))
+  facet_wrap(~ Bandwidth, ncol = 4) + theme_bw() + labs(y = "Effect size (Beta ± 95% CI)")
+
+ggsave("Effect_Sizes_Final.pdf", fig4, width = 12, height = 8)
 
 # =====================================================
-# 0. LIBRARIES & PARALLEL SETUP
+# 7. SUPPLEMENTARY EXPORTS (S4, S5)
 # =====================================================
-library(dplyr)
-library(stringr)
-library(lubridate)
-library(tidyr)
-library(ggplot2)
-library(nlme)
-library(foreach)
-library(doSNOW)
-library(caret)
+write.csv(bind_rows(variance_explained_list), "PCA_Variance_Explained.csv", row.names = FALSE)
+write.csv(bind_rows(loadings_list), "PCA_Loadings.csv", row.names = FALSE)
 
-set.seed(42)
-
-# Set up the cluster for permutations
-n_cores <- parallel::detectCores() - 1
-cl <- makeCluster(n_cores)
-registerDoSNOW(cl)
-
-# =====================================================
-# 1. IMPORT & INITIAL PROCESSING
-# =====================================================
-dir_path <- "C:/Users/Administrador/OneDrive - McGill University/Light pollution and pond soundscapes/Feb 2026/Without NDSI & Anthro_Energy/All data"
-setwd(dir_path)
-
-txt_files <- list.files(path = ".", pattern = "\\.txt$", full.names = TRUE)
-
-df_global_raw <- lapply(txt_files, function(f) {
-  dat <- read.csv(f, stringsAsFactors = FALSE)
-  dat$source_txt <- basename(f) 
-  return(dat)
-}) %>% bind_rows()
-
-# =====================================================
-# 2. METADATA & TREATMENT ASSIGNMENT
-# =====================================================
-df_global_proc <- df_global_raw %>%
-  mutate(
-    Site = case_when(
-      str_detect(filename, "EF")    ~ "EF",
-      str_detect(filename, "FWF|FF") ~ "FF",
-      str_detect(filename, "OSP")   ~ "OSP",
-      str_detect(filename, "UoBBG") ~ "UoBBG",
-      TRUE                          ~ NA_character_
-    ),
-    txt_low = tolower(source_txt),
-    Bandwidth = case_when(
-      str_detect(txt_low, "1-10khz")  ~ "1 - 10 kHz",
-      str_detect(txt_low, "10-20khz") ~ "10 - 20 kHz",
-      str_detect(txt_low, "20-30khz") ~ "20 - 30 kHz",
-      str_detect(txt_low, "30-40khz") ~ "30 - 40 kHz",
-      str_detect(txt_low, "40-47khz") ~ "40 - 47 kHz",
-      str_detect(txt_low, "7-14khz")  ~ "7 - 14 kHz",
-      str_detect(txt_low, "2-5khz")   ~ "2 - 5 kHz",
-      TRUE                            ~ "Other"
-    ),
-    raw_ts = str_extract(filename, "\\d{8}_\\d{6}"),
-    Datetime = as.POSIXct(raw_ts, format = "%Y%m%d_%H%M%S", tz = "Europe/London"),
-    Exp_Date = as.Date(Datetime)
-  ) %>%
-  filter(!is.na(Site), !is.na(Datetime), Bandwidth != "Other")
-
-assign_treatment <- function(Site, Exp_Date) {
-  if (Site == "OSP" && Exp_Date == as.Date("2025-08-25")) {
-    data.frame(Treatment = c("Phase I", "Phase II", "Phase III"),
-               S = c("21:11", "22:11", "23:11"), E = c("22:10", "23:10", "00:10"))
-  } else if (Site == "OSP" && Exp_Date == as.Date("2025-08-27")) {
-    data.frame(Treatment = c("Phase I", "Phase II", "Phase III"),
-               S = c("21:07", "22:07", "23:07"), E = c("22:06", "23:06", "00:06"))
-  } else if (Site == "OSP") {
-    data.frame(Treatment = c("Phase I", "Phase II", "Phase III"),
-               S = c("21:08", "22:08", "23:08"), E = c("22:07", "23:07", "00:07"))
-  } else if (Site == "UoBBG") {
-    data.frame(Treatment = c("Phase I", "Phase II", "Phase III"),
-               S = c("21:04", "22:04", "23:04"), E = c("22:03", "23:03", "00:03"))
-  } else if (Site == "FF") {
-    data.frame(Treatment = c("Phase I", "Phase II", "Phase III"),
-               S = c("20:49", "21:49", "22:49"), E = c("21:48", "22:48", "23:48"))
-  } else { 
-    data.frame(Treatment = c("Phase I", "Phase II", "Phase III"),
-               S = c("20:51", "21:51", "22:51"), E = c("21:50", "22:50", "23:50"))
-  }
-}
-
-df_global_treated <- df_global_proc %>%
-  rowwise() %>%
-  mutate(phases = list(assign_treatment(Site, Exp_Date))) %>%
-  ungroup() %>%
-  tidyr::unnest(phases) %>%
-  mutate(
-    Start = as.POSIXct(paste(Exp_Date, S), format = "%Y-%m-%d %H:%M", tz = "Europe/London"),
-    End = as.POSIXct(ifelse(E < S, paste(Exp_Date + 1, E), paste(Exp_Date, E)),
-                     format = "%Y-%m-%d %H:%M", tz = "Europe/London")
-  ) %>%
-  filter(Datetime >= Start & Datetime <= End) %>%
-  mutate(
-    Treatment = factor(Treatment, levels = c("Phase I", "Phase II", "Phase III")),
-    Bandwidth = as.factor(Bandwidth)
-  )
-
-# =====================================================
-# 3. BAND-SPECIFIC PCA
-# =====================================================
-priority_vars <- c("ACI", "Bio_Energy", "Event_Count", "ZCR_Mean")
-spectral_vars <- c("ADI", "RMS_Mean", paste0("MFCC_", 1:13))
-pca_vars_full <- c(priority_vars, spectral_vars)
-
-bands <- unique(df_global_treated$Bandwidth)
-band_data_list <- list()
-
-for(b in bands) {
-  b_data <- df_global_treated %>% filter(Bandwidth == b)
-  b_scaled <- b_data %>% mutate(across(all_of(pca_vars_full), ~ as.numeric(scale(.))))
-  valid_cols <- sapply(b_scaled[pca_vars_full], function(x) !any(is.na(x)) && var(x, na.rm=TRUE) > 0)
-  valid_vars <- names(valid_cols)[valid_cols]
-  
-  cor_matrix <- cor(b_scaled[, valid_vars], use="complete.obs")
-  to_remove_indices <- findCorrelation(cor_matrix, cutoff=0.8)
-  
-  pca_vars_b <- if(length(to_remove_indices) > 0) {
-    setdiff(valid_vars, setdiff(valid_vars[to_remove_indices], priority_vars))
-  } else { valid_vars }
-  
-  pca_res <- prcomp(b_scaled[, pca_vars_b], center=FALSE, scale.=FALSE)
-  b_data$PC1 <- pca_res$x[,1]
-  b_data$PC2 <- pca_res$x[,2]
-  band_data_list[[b]] <- b_data
-}
-
-df_model <- bind_rows(band_data_list) %>% arrange(Site, Exp_Date, Bandwidth, Datetime)
-
-# =====================================================
-# 4. MAIN LOOP: LME & BLOCK PERMUTATIONS
-# =====================================================
-pcs_to_model <- c("PC1", "PC2")
-n_perms <- 999
-all_results_list <- list()
-
-for(current_pc in pcs_to_model) {
-  for(current_band in bands) {
-    sub_data <- df_model %>% 
-      filter(Bandwidth == current_band) %>%
-      filter(!is.na(!!sym(current_pc))) %>%
-      arrange(Site, Exp_Date, Datetime) %>%
-      group_by(Site, Exp_Date) %>%
-      mutate(Time_Index = row_number()) %>% ungroup()
-    
-    if(nrow(sub_data) < 10) next
-    model_formula <- as.formula(paste(current_pc, "~ Treatment"))
-    
-    obs_model <- try(lme(fixed = model_formula, random = ~ 1 | Site/Exp_Date, 
-                         correlation = corAR1(form = ~ Time_Index | Site/Exp_Date),
-                         data = sub_data, control = lmeControl(opt = "optim")), silent = TRUE)
-    
-    if(inherits(obs_model, "try-error")) next
-    
-    summ_tab <- summary(obs_model)$tTable
-    obs_t_p2 <- summ_tab["TreatmentPhase II", "t-value"]
-    obs_t_p3 <- summ_tab["TreatmentPhase III", "t-value"]
-    
-    null_dist <- foreach(i = 1:n_perms, .combine = 'rbind', .packages = c('nlme', 'dplyr')) %dopar% {
-      p_data <- sub_data %>% group_by(Site) %>% mutate(Treatment = sample(Treatment)) %>% ungroup()
-      p_mod <- try(lme(fixed = model_formula, random = ~ 1 | Site/Exp_Date, 
-                       correlation = corAR1(form = ~ Time_Index | Site/Exp_Date),
-                       data = p_data, control = lmeControl(opt = "optim")), silent = TRUE)
-      if(!inherits(p_mod, "try-error")) {
-        tt <- summary(p_mod)$tTable
-        return(c(p2 = tt["TreatmentPhase II", "t-value"], p3 = tt["TreatmentPhase III", "t-value"]))
-      } else { return(c(p2 = NA, p3 = NA)) }
-    }
-    
-    null_dist <- as.data.frame(null_dist)
-    p_val_p2 <- (sum(abs(na.omit(null_dist$p2)) >= abs(obs_t_p2)) + 1) / (sum(!is.na(null_dist$p2)) + 1)
-    p_val_p3 <- (sum(abs(na.omit(null_dist$p3)) >= abs(obs_t_p3)) + 1) / (sum(!is.na(null_dist$p3)) + 1)
-    
-    all_results_list[[paste0(current_pc, "_", current_band)]] <- data.frame(
-      Component = current_pc, Bandwidth = current_band,
-      Beta_P2 = summ_tab["TreatmentPhase II", "Value"], SE_P2 = summ_tab["TreatmentPhase II", "Std.Error"], Perm_P_P2 = p_val_p2,
-      Beta_P3 = summ_tab["TreatmentPhase III", "Value"], SE_P3 = summ_tab["TreatmentPhase III", "Std.Error"], Perm_P_P3 = p_val_p3
-    )
-  }
-}
-
-stopCluster(cl)
-results_raw <- bind_rows(all_results_list)
-
-# =====================================================
-# 5. MULTIPLE TESTING CORRECTION (FDR)
-# =====================================================
-results <- results_raw %>%
-  group_by(Component) %>% 
-  mutate(
-    FDR_P_P2 = p.adjust(Perm_P_P2, method = "fdr"),
-    FDR_P_P3 = p.adjust(Perm_P_P3, method = "fdr")
-  ) %>%
-  ungroup()
-
-# =====================================================
-# 6. DATA PREP FOR VISUALIZATION
-# =====================================================
-plot_data_faceted <- bind_rows(
-  results %>% select(Component, Bandwidth, Beta = Beta_P2, SE = SE_P2, pval = FDR_P_P2) %>% mutate(Phase = "Phase II (Light)"),
-  results %>% select(Component, Bandwidth, Beta = Beta_P3, SE = SE_P3, pval = FDR_P_P3) %>% mutate(Phase = "Phase III (Recovery)")
-) %>%
-  mutate(
-    CI_L = Beta - (1.96 * SE),
-    CI_U = Beta + (1.96 * SE),
-    sig = ifelse(pval < 0.05, "*", ""),
-    Phase = factor(Phase, levels = c("Phase II (Light)", "Phase III (Recovery)")),
-    Bandwidth = factor(Bandwidth, levels = c("2 - 5 kHz", "7 - 14 kHz", "1 - 10 kHz", "10 - 20 kHz", "20 - 30 kHz", "30 - 40 kHz", "40 - 47 kHz"))
-  )
-
-# =====================================================
-# 7. FINAL VISUALIZATION (Figure 4)
-# =====================================================
-ggplot(plot_data_faceted, aes(x = Component, y = Beta, color = Phase, shape = Component, linetype = Component)) +
-  annotate("rect", xmin = -Inf, xmax = Inf, ymin = -0.2, ymax = 0.2, fill = "gray90", alpha = 0.5) +
-  geom_hline(yintercept = 0, linetype = "dotted", color = "black", alpha = 0.5) +
-  geom_errorbar(aes(ymin = CI_L, ymax = CI_U), width = 0.3, linewidth = 0.8, position = position_dodge(0.7), show.legend = FALSE) +
-  geom_point(size = 4, position = position_dodge(0.7)) +
-  geom_text(aes(label = sig, y = CI_U + 0.12), position = position_dodge(0.7), size = 8, color = "black", fontface = "bold") +
-  scale_shape_manual(values = c("PC1" = 16, "PC2" = 17)) +
-  scale_color_manual(values = c("Phase II (Light)" = "#E69F00", "Phase III (Recovery)" = "#56B4E9")) +
-  scale_linetype_manual(values = c("PC1" = "solid", "PC2" = "dotted")) +
-  facet_wrap(~ Bandwidth, ncol = 4) +
-  theme_bw() +
-  labs(
-    x = "Principal component", 
-    y = "Effect size (Beta ± 95% CI)",
-    caption = "Stars indicate FDR-corrected p < 0.05 via block permutation."
-  ) +
-  theme(legend.position = "bottom", strip.text = element_text(face = "bold"))
-
-plot_data_faceted
-
-
-# =====================================================
-# 7. MODEL DIAGNOSTICS (Table S3)
-# =====================================================
-
-library(MuMIn) 
-library(car)   
-
-diagnostic_list <- list()
-if(!dir.exists("Diagnostics")) dir.create("Diagnostics")
-
-for(current_pc in pcs_to_model) {
-  for(current_band in bands) {
-    sub_data <- df_model %>% filter(Bandwidth == current_band)
-    model_formula <- as.formula(paste(current_pc, "~ Treatment"))
-    
-    fit <- try(lme(fixed = model_formula, 
-                   random = ~ 1 | Site/Exp_Date, 
-                   correlation = corAR1(form = ~ 1 | Site/Exp_Date),
-                   data = sub_data, control = lmeControl(opt = "optim")), silent = TRUE)
-    
-    if(inherits(fit, "try-error")) next
-    
-    r2 <- r.squaredGLMM(fit)
-    resids <- residuals(fit, type = "normalized")
-    shapiro_res <- shapiro.test(resids)
-    acf_val <- acf(resids, plot = FALSE)$acf[2]
-    
-    diagnostic_list[[paste0(current_pc, "_", current_band)]] <- data.frame(
-      Component = current_pc,
-      Bandwidth = current_band,
-      R2_Marginal = r2[1, "R2m"],
-      R2_Conditional = r2[1, "R2c"],
-      Shapiro_P = shapiro_res$p.value,
-      Lag1_ACF = acf_val
-    )
-  }
-}
-
-Model_Diagnostics <- bind_rows(diagnostic_list)
-write.csv(Model_Diagnostics, "Model_Diagnostics_BandSpecific.csv", row.names = FALSE)
-
-# =====================================================
-# 8. PC1 and PC2 Loadings & Variance Explained (Table S4)
-# =====================================================
-cat("\n--- Exporting PCA Variance and Loadings for All Bands ---\n")
-
-# 1. Combine and Export Variance Explained
-Variance_Explained_All <- bind_rows(variance_explained_list) %>%
-  mutate(Total_Variance_Captured = PC1_Var_Explained + PC2_Var_Explained)
-
-write.csv(Variance_Explained_All, "PCA_Variance_Explained_By_Band.csv", row.names = FALSE)
-cat("Saved: PCA_Variance_Explained_By_Band.csv\n")
-
-# 2. Combine and Export Loadings
-Loadings_All <- bind_rows(loadings_list) %>%
-  mutate(
-    Importance_PC1 = abs(PC1_Loading),
-    Importance_PC2 = abs(PC2_Loading)
-  ) %>%
-  # Reorder columns so Bandwidth is first, making it easy to read
-  select(Bandwidth, Variable, PC1_Loading, Importance_PC1, PC2_Loading, Importance_PC2) %>%
-  # Sort by Bandwidth, then by the strongest drivers of PC1
-  arrange(Bandwidth, desc(Importance_PC1))
-
-write.csv(Loadings_All, "PCA_Loadings_By_Band.csv", row.names = FALSE)
-cat("Saved: PCA_Loadings_By_Band.csv\n")
-
-# =====================================================
-#  9. Variance explained by modelled random and fixed effects (Table S5)
-# =====================================================
-
-# Assuming Final_Permutation_Results contains SD_Site, SD_ExpDate, and SD_Residual
-ICC_Results <- Final_Permutation_Results %>%
-  mutate(
-    Var_Total = SD_Site^2 + SD_ExpDate^2 + SD_Residual^2,
-    Pct_Site = (SD_Site^2 / Var_Total) * 100,
-    Pct_Date = (SD_ExpDate^2 / Var_Total) * 100,
-    Pct_Residual = (SD_Residual^2 / Var_Total) * 100
-  ) %>%
+ICC_Summary <- Final_Permutation_Results %>%
+  mutate(Var_Total = SD_Site^2 + SD_ExpDate^2 + SD_Residual^2,
+         Pct_Site = (SD_Site^2 / Var_Total) * 100, Pct_Date = (SD_ExpDate^2 / Var_Total) * 100, Pct_Residual = (SD_Residual^2 / Var_Total) * 100) %>%
   select(Component, Bandwidth, Pct_Site, Pct_Date, Pct_Residual)
+write.csv(ICC_Summary, "Variance_Partitioning_ICC.csv", row.names = FALSE)
 
-# View the reordered table
-freq_order <- c("2 - 5 kHz", "7 - 14 kHz", "1 - 10 kHz", "10 - 20 kHz", "20 - 30 kHz", "30 - 40 kHz", "40 - 47 kHz")
-
-ICC_Summary <- ICC_Results %>%
-  mutate(Bandwidth = factor(Bandwidth, levels = freq_order)) %>%
-  arrange(Component, Bandwidth)
-
-print(ICC_Summary)
+# =====================================================
+# 8. OSP REPLICATION CHECK
+# =====================================================
+osp_baseline <- df_model %>% filter(Site == "OSP", Treatment == "Phase I")
+summary(aov(PC1 ~ as.factor(Exp_Date), data = osp_baseline))
 
 ```
